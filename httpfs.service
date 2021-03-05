@@ -1,0 +1,12 @@
+[Unit]
+Description=Logging fileserver
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/DIR
+ExecStart=/opt/DIR/EXECUTABLE -settings settings.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
