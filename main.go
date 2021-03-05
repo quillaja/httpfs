@@ -1,15 +1,37 @@
-// This program provides a simple server that writes a string payload to file.
-// Requests are POSTed to root ("/") and the body is a json object of format:
+// This program provides a simple server that provides basic CRUD access to
+// a filesystem on the server. Files are specified using the URL
+// (eg www.example.com/mypath/myfile.txt) and the action is specified using
+// HTTP methods:
 //
-// {
-// 	"APIKey": "your_key",
-// 	"Filename": "/rooted/filepath.txt",
-// 	"Payload": "some string to append\\n"
-// }
+// 		GET - read the entire file
+//		POST - create/append to the file
+//		PUT - create/truncate (overwrite) the file
+//		DELETE - delete the file
+//
+// Authorization credentials are provided via the `Authorization` HTTP header,
+// using the `Basic` scheme. Instead of a "password", a previously obtained API
+// key is used. A username should be provided but is not currently used. The server
+// should use HTTPS to encrypt the credentials and file contents over the wire.
 //
 // Files will be created in a directory configured in settings, and each API key
 // will have its own subdirectory for files.
-
+//
+// A settings file must be provided. `APIKeys` maps api keys to their "sandbox"
+// subdirectory of the `FileRoot`. API keys must be unique, but multiple keys
+// can map to the same subdirectory.
+// For example:
+//
+//		{
+//		  "Port": 443,
+//		  "FileRoot": "files",
+//		  "TLSCertPath": "path/to/certificate",
+//		  "TLSKeyPath": "path/to/key",
+//		  "APIKeys": {
+//		    "SOME_KEY_1234": "hamburger",
+//		    "ANOTHER_KEY_0987": "hotdog"
+//		  }
+//		}
+//
 package main
 
 import (
@@ -17,7 +39,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -57,7 +78,7 @@ type Settings struct {
 
 // OpenSettings file at the given path.
 func OpenSettings(path string) (s Settings, err error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -85,7 +106,7 @@ func (s Settings) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(path, data, filePerm)
+	err = os.WriteFile(path, data, filePerm)
 	if err != nil {
 		return err
 	}
@@ -111,14 +132,21 @@ func main() {
 	http.HandleFunc("/", reqHandler(s))
 
 	address := fmt.Sprintf(":%d", s.Port)
-	log.Printf("listening for https on %s\n", address)
-	err = http.ListenAndServeTLS(address, s.TLSCertPath, s.TLSKeyPath, nil)
+	if s.TLSCertPath == "" || s.TLSKeyPath == "" {
+		log.Println("no TLS certificate and/or key provided")
+		log.Printf("listening for http on %s\n", address)
+		err = http.ListenAndServe(address, nil)
+	} else {
+		log.Printf("using certificate: %s, key: %s\n", s.TLSCertPath, s.TLSKeyPath)
+		log.Printf("listening for https on %s\n", address)
+		err = http.ListenAndServeTLS(address, s.TLSCertPath, s.TLSKeyPath, nil)
+	}
 	if err != nil {
 		log.Fatalf("error starting server: %s\n", err)
 	}
 }
 
-// reqHandler decodes, validates, and executes the request.
+// reqHandler validates and executes the request.
 func reqHandler(s Settings) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 
@@ -135,7 +163,7 @@ func reqHandler(s Settings) http.HandlerFunc {
 		resourcePath := req.URL.Path
 		localpath := filepath.Join(s.FileRoot, string(userdir), resourcePath)
 		if resourcePath == "/" {
-			log.Printf("error: no file specified by '%s':'%s'\n", username, key)
+			log.Printf("no file specified by '%s':'%s'\n", username, key)
 			http.Error(w, "no file specified", http.StatusBadRequest)
 			return
 		}
