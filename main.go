@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -29,11 +30,29 @@ const (
 	dirPerm  = 0755
 )
 
+// common http ports
+const (
+	httpPort  = 80
+	httpsPort = 443
+)
+
+type apikey string
+type directory string
+
 // Settings for the application.
 type Settings struct {
-	Port     int
+	// Port on which to listen
+	Port int
+
+	// directory for root of served filesystem
 	FileRoot string
-	APIKeys  map[string]string
+
+	// TLS certificate filepaths
+	TLSCertPath string
+	TLSKeyPath  string
+
+	// api key -> directory map
+	APIKeys map[apikey]directory
 }
 
 // OpenSettings file at the given path.
@@ -52,9 +71,11 @@ func OpenSettings(path string) (s Settings, err error) {
 // DefaultSettings returns a populated 'default'.
 func DefaultSettings() Settings {
 	return Settings{
-		Port:     8080,
-		FileRoot: "files",
-		APIKeys:  map[string]string{},
+		Port:        httpsPort,
+		FileRoot:    "files",
+		TLSCertPath: "path/to/certificate",
+		TLSKeyPath:  "path/to/key",
+		APIKeys:     map[apikey]directory{"api_key": "dir_for_this_key"},
 	}
 }
 
@@ -72,74 +93,92 @@ func (s Settings) Save(path string) error {
 }
 
 func main() {
-	settingsPath := flag.String("settings", "settings.json", "File containing program settings.")
+	settingsPath := flag.String("settings", "settings.json", "File containing program settings. If set to 'default', a template settings file will be written to 'default.json'.")
 	flag.Parse()
 
+	log.SetOutput(os.Stdout) // send log to stdout for systemd
+
+	if *settingsPath == "default" {
+		DefaultSettings().Save("default.json")
+		log.Println("Default template settings file written to 'default.json'.")
+		os.Exit(0)
+	}
 	s, err := OpenSettings(*settingsPath)
 	if err != nil {
 		log.Fatalf("error opening settings '%s': %s\n", *settingsPath, err)
 	}
 
-	http.HandleFunc("/", postHandler(s))
+	http.HandleFunc("/", reqHandler(s))
 
 	address := fmt.Sprintf(":%d", s.Port)
-	log.Printf("listening on %s\n", address)
-	err = http.ListenAndServe(address, nil)
+	log.Printf("listening for https on %s\n", address)
+	err = http.ListenAndServeTLS(address, s.TLSCertPath, s.TLSKeyPath, nil)
 	if err != nil {
 		log.Fatalf("error starting server: %s\n", err)
 	}
 }
 
-// Message is the expected structure of a json object POSTed to the server root.
-type Message struct {
-	APIKey   string
-	Filename string
-	Payload  string
-}
-
-// postHandler decodes, validates, and executes the request.
-func postHandler(s Settings) http.HandlerFunc {
+// reqHandler decodes, validates, and executes the request.
+func reqHandler(s Settings) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		// ensure POST
-		if req.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusBadRequest)
-			return
-		}
 
-		// decode request body into Message
-		var msg Message
-		dec := json.NewDecoder(req.Body)
-		err := dec.Decode(&msg)
-		if err != nil {
-			log.Printf("error decoding request body: %s\n", err)
-			http.Error(w, "malformed request body", http.StatusBadRequest)
-			return
-		}
-		req.Body.Close()
-
-		// check that the request provided a valid "key"
-		if app, exist := s.APIKeys[msg.APIKey]; !exist {
-			log.Printf("request with unrecognized api key '%s'\n", msg.APIKey)
+		// authorize
+		username, key, ok := req.BasicAuth()
+		userdir, found := s.APIKeys[apikey(key)]
+		if !ok || !found {
+			log.Printf("request with unrecognized api key '%s'\n", key)
 			http.Error(w, "unrecognized api key", http.StatusUnauthorized)
 			return
-		} else {
-			log.Printf("processing request from '%s' given key '%s'\n", app, msg.APIKey)
 		}
 
-		// perform the actual file operation
-		localpath := filepath.Join(s.FileRoot, msg.APIKey, msg.Filename)
-		err = appendFile(localpath, msg.Payload)
-		if err != nil {
-			log.Printf("error with '%s':%s\n", localpath, err)
-			http.Error(w, "error appending to file", http.StatusInternalServerError)
+		// get file to process
+		resourcePath := req.URL.Path
+		localpath := filepath.Join(s.FileRoot, string(userdir), resourcePath)
+		if resourcePath == "/" {
+			log.Printf("error: no file specified by '%s':'%s'\n", username, key)
+			http.Error(w, "no file specified", http.StatusBadRequest)
 			return
 		}
+		log.Printf("%s '%s' from '%s':'%s'\n", req.Method, localpath, username, key)
+
+		// do something with file depending on http method
+		var doing string
+		var err error
+		defer req.Body.Close()
+
+		switch req.Method {
+		case http.MethodGet:
+			doing = "reading"
+			err = readFile(localpath, w)
+
+		case http.MethodDelete:
+			doing = "deleting"
+			err = deleteFile(localpath)
+
+		case http.MethodPost:
+			doing = "appending"
+			err = writeFile(os.O_APPEND, localpath, req.Body)
+
+		case http.MethodPut:
+			doing = "truncating"
+			err = writeFile(os.O_TRUNC, localpath, req.Body)
+
+		default:
+			http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if err != nil {
+			log.Printf("error %s:%s\n", req.Method, err)
+			http.Error(w, fmt.Sprintf("error %s file", doing), http.StatusInternalServerError)
+		}
+
 	}
 }
 
-// appendFile appends payload to the file at path, creating the file and any
-// required directories.
-func appendFile(path string, payload string) error {
+// writeFile appends or truncates, according to the flag, the file at path,
+// creating the file and any required directories.
+func writeFile(flag int, path string, src io.Reader) error {
 	// create directories if necessary
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
@@ -147,16 +186,41 @@ func appendFile(path string, payload string) error {
 	}
 
 	// open file
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, filePerm)
+	file, err := os.OpenFile(path, flag|os.O_CREATE|os.O_WRONLY, filePerm)
 	if err != nil {
-		return fmt.Errorf("error with requested file '%s': %w", path, err)
+		return fmt.Errorf("error opening file '%s': %w", path, err)
 	}
 	defer file.Close()
 
 	// write
-	_, err = file.WriteString(payload)
+	_, err = io.Copy(file, src)
 	if err != nil {
 		return fmt.Errorf("error writing payload to %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// readFile reads the file at path and write its contents into dest.
+func readFile(path string, dest io.Writer) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("error opening file '%s': %w", path, err)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(dest, file)
+	if err != nil {
+		return fmt.Errorf("error reading file '%s': %w", path, err)
+	}
+
+	return nil
+}
+
+// deleteFile deletes the file at path.
+func deleteFile(path string) error {
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("error deleting file '%s': %w", path, err)
 	}
 
 	return nil
