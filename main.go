@@ -43,6 +43,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/quillaja/sysdlog"
 )
 
 // permissions used in creating files and directories
@@ -62,8 +65,8 @@ type directory string
 
 // Settings for the application.
 type Settings struct {
-	// Port on which to listen
-	Port int
+	// Address:Port on which to listen
+	Address string
 
 	// directory for root of served filesystem
 	FileRoot string
@@ -92,7 +95,7 @@ func OpenSettings(path string) (s Settings, err error) {
 // DefaultSettings returns a populated 'default'.
 func DefaultSettings() Settings {
 	return Settings{
-		Port:        httpsPort,
+		Address:     fmt.Sprintf(":%d", httpsPort),
 		FileRoot:    "files",
 		TLSCertPath: "path/to/certificate",
 		TLSKeyPath:  "path/to/key",
@@ -113,36 +116,68 @@ func (s Settings) Save(path string) error {
 	return nil
 }
 
+type httpfsServer struct {
+	settings Settings
+	logger   *sysdlog.LevelLogger
+	server   *http.Server
+}
+
+func NewHTTPFSServer(s Settings) *httpfsServer {
+	fs := &httpfsServer{
+		settings: s,
+		logger:   sysdlog.NewLevelLogger(log.New(os.Stdout, "", 0)),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", reqHandler(s))
+
+	fs.server = &http.Server{
+		Addr:         s.Address,
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	return fs
+}
+
+func (fs *httpfsServer) ListenAndServe() (err error) {
+	if fs.settings.TLSCertPath == "" || fs.settings.TLSKeyPath == "" {
+		fs.logger.Println("no TLS certificate and/or key provided")
+		fs.logger.Printf("listening for http on %s\n", fs.server.Addr)
+		err = fs.server.ListenAndServe()
+	} else {
+		fs.logger.Printf("using certificate: %s, key: %s\n", fs.settings.TLSCertPath, fs.settings.TLSKeyPath)
+		fs.logger.Printf("listening for https on %s\n", fs.server.Addr)
+		err = fs.server.ListenAndServeTLS(fs.settings.TLSCertPath, fs.settings.TLSKeyPath)
+	}
+	if err != nil {
+		fs.logger.SetLevel(sysdlog.Alert)
+		fs.logger.Printf("error starting server: %s\n", err)
+	}
+	return err
+}
+
 func main() {
 	settingsPath := flag.String("settings", "settings.json", "File containing program settings. If set to 'default', a template settings file will be written to 'default.json'.")
 	flag.Parse()
 
-	log.SetOutput(os.Stdout) // send log to stdout for systemd
-
 	if *settingsPath == "default" {
 		DefaultSettings().Save("default.json")
-		log.Println("Default template settings file written to 'default.json'.")
+		fmt.Println("Default template settings file written to 'default.json'.")
 		os.Exit(0)
 	}
 	s, err := OpenSettings(*settingsPath)
 	if err != nil {
-		log.Fatalf("error opening settings '%s': %s\n", *settingsPath, err)
+		fmt.Printf("fatal error opening settings '%s': %s\n", *settingsPath, err)
+		os.Exit(1)
 	}
 
-	http.HandleFunc("/", reqHandler(s))
-
-	address := fmt.Sprintf(":%d", s.Port)
-	if s.TLSCertPath == "" || s.TLSKeyPath == "" {
-		log.Println("no TLS certificate and/or key provided")
-		log.Printf("listening for http on %s\n", address)
-		err = http.ListenAndServe(address, nil)
-	} else {
-		log.Printf("using certificate: %s, key: %s\n", s.TLSCertPath, s.TLSKeyPath)
-		log.Printf("listening for https on %s\n", address)
-		err = http.ListenAndServeTLS(address, s.TLSCertPath, s.TLSKeyPath, nil)
-	}
+	fs := NewHTTPFSServer(s)
+	err = fs.ListenAndServe()
 	if err != nil {
-		log.Fatalf("error starting server: %s\n", err)
+		os.Exit(1)
 	}
 }
 
