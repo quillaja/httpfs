@@ -22,7 +22,7 @@ can map to the same subdirectory.
 For example:
 	
     {
-	  "Port": 443,
+	  "Address": ":443",
 	  "FileRoot": "files",
 	  "TLSCertPath": "path/to/certificate",
 	  "TLSKeyPath": "path/to/key",
