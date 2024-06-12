@@ -19,6 +19,16 @@ const (
 	dirPerm  = 0755
 )
 
+// Applies CORS headers to all responses to allow access.
+func addCORSHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Add("Access-Control-Allow-Origin", "*")
+		w.Header().Add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+		w.Header().Add("Access-Control-Allow-Headers", "*")
+		h.ServeHTTP(w, req)
+	})
+}
+
 // httpfsServer encapsulates the core functionality of the application
 // around a server and logger.
 type httpfsServer struct {
@@ -36,7 +46,7 @@ func NewHTTPFSServer(cfg Config) *httpfsServer {
 	fs.logger.SetLevel(sysdlog.Info) // initial level
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", fs.reqHandler)
+	mux.Handle("/", addCORSHeaders(http.HandlerFunc(fs.reqHandler)))
 
 	fs.server = &http.Server{
 		Addr:         cfg.Address,
@@ -80,6 +90,10 @@ func (fs *httpfsServer) Shutdown(ctx context.Context) error {
 func (fs *httpfsServer) reqHandler(w http.ResponseWriter, req *http.Request) {
 
 	fs.logger.SetLevel(sysdlog.Info)
+
+	if req.Method == http.MethodOptions {
+		return // status 200 with cors headers
+	}
 
 	// authorize
 	username, key, ok := req.BasicAuth()
