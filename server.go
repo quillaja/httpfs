@@ -91,6 +91,8 @@ func (fs *httpfsServer) reqHandler(w http.ResponseWriter, req *http.Request) {
 
 	fs.logger.SetLevel(sysdlog.Info)
 
+	w.Header().Add("Cache-Control", "no-cache") // make client validate cached data
+
 	if req.Method == http.MethodOptions {
 		return // status 200 with cors headers
 	}
